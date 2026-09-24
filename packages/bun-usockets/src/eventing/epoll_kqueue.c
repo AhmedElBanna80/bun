@@ -474,7 +474,8 @@ extern unsigned int Bun__JSC_onBeforeWait(void * _Nonnull jsc_vm, uint64_t now_n
 extern void Bun__JSC_acquireHeapAccessAfterWait(void * _Nonnull jsc_vm);
 
 void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout, uint64_t now_ns) {
-    if (loop->num_polls == 0)
+    /* A queued child exit is reported from loop_post, whatever the poll count says. */
+    if (loop->num_polls == 0 && !loop->data.exited_children)
         return;
 
     loop->data.tick_depth++;
@@ -499,6 +500,10 @@ void us_loop_run_bun_tick(struct us_loop_t *loop, const struct timespec* timeout
 
     struct timespec sweep_ts;
     timeout = us_internal_clamp_to_sweep(loop, timeout, &sweep_ts);
+
+    /* Never wait on a queued child exit: poll what is ready, then loop_post reports it. */
+    static const struct timespec no_wait = {0, 0};
+    if (loop->data.exited_children) timeout = &no_wait;
 
     const unsigned int had_wakeups = __atomic_exchange_n(&loop->pending_wakeups, 0, __ATOMIC_ACQUIRE);
     const int will_idle_inside_event_loop = had_wakeups == 0 && (!timeout || (timeout->tv_nsec != 0 || timeout->tv_sec != 0));

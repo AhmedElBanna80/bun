@@ -93,6 +93,9 @@ struct us_internal_loop_data_t {
      * sockets must be deferred to the outermost tick so the outer dispatch
      * doesn't read a freed poll. */
     int tick_depth;
+    /* Child processes whose exit this loop was told of and has not reported (bun_spawn's list).
+     * loop_post reports them after the tick's I/O, as libuv's uv__wait_children does. */
+    void *exited_children;
 };
 
 #endif // LOOP_DATA_H

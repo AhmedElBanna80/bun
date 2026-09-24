@@ -63,6 +63,8 @@ pub struct InternalLoopData {
     // Higher tier (`bun_runtime`) casts this back when reading.
     pub jsc_vm: *const c_void,
     pub tick_depth: c_int,
+    /// `bun_spawn`'s list of exited children this loop has not reported yet; C only tests it.
+    pub exited_children: *mut c_void,
 }
 
 impl InternalLoopData {

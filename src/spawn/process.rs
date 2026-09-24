@@ -21,6 +21,8 @@ use bun_sys::ReturnCodeExt as _;
 #[cfg(windows)]
 use bun_sys::windows::libuv as uv;
 use bun_sys::{self, Fd, Maybe};
+#[cfg(unix)]
+use bun_uws_sys::Loop as UwsLoop;
 #[cfg(windows)]
 use uv::{UvHandle as _, UvStream as _};
 
@@ -133,6 +135,15 @@ pub struct Process {
     /// (`None` when owned by a mini event loop, which it posts to directly).
     #[cfg(unix)]
     pub(crate) js_poster: Option<bun_event_loop::JsPoster>,
+    /// Next in its loop's list of exits told and not reported (`push_exited`); null when not in it.
+    #[cfg(unix)]
+    next_exited: *mut Process,
+    /// While in that list: the waiter thread's `wait4` result, or `None` when a poll fired.
+    #[cfg(unix)]
+    reaped: Option<Box<waiter_thread_posix::ResultTask<Process>>>,
+    /// While in that list: the loop iteration that must be over before the exit is reported.
+    #[cfg(unix)]
+    report_after: u64,
 }
 
 impl Drop for Process {
@@ -294,6 +305,9 @@ impl Process {
             poller: Poller::Detached,
             status,
             exit_handler: ProcessExitHandler::default(),
+            next_exited: core::ptr::null_mut(),
+            reaped: None,
+            report_after: 0,
         }))
     }
 
@@ -327,40 +341,113 @@ impl Process {
         let _ = sync_;
     }
 
-    /// # Safety
-    /// `this` carries the +1 ref taken when the waiter-thread task was queued.
-    /// `RefPtr::from_raw` releases it on return — which may free `this` — so
-    /// this takes `*mut Self`, not `&mut self` (a `&mut` argument's
-    /// Stacked-Borrows protector outliving the allocation is UB; see :215).
+    /// The poll watching `this` (pidfd / `EVFILT_PROC`) fired: queue the exit for `wait_children`.
     #[cfg(unix)]
-    pub(crate) unsafe fn on_wait_pid_from_waiter_thread(
-        this: *mut Self,
-        waitpid_result: &bun_sys::Result<WaitPidResult>,
-        rusage: &Rusage,
-    ) {
-        // SAFETY: caller contract — adopts the queued +1 ref.
-        let _guard = unsafe { RefPtr::from_raw(this) };
-        // SAFETY: `_guard` keeps `this` live; `&mut` scoped to the poller unref.
+    pub fn mark_reapable(this: bun_ptr::ThisPtr<Self>) {
+        let this = this.as_ptr();
+        // SAFETY: `ThisPtr` is live; a level-triggered pidfd fires again while `this` is queued.
         unsafe {
-            if let Poller::WaiterThread(waiter) = &mut (*this).poller {
-                let ctx = event_loop_handle_to_ctx((*this).event_loop);
-                waiter.unref(ctx);
-                (*this).poller = Poller::Detached;
+            if (*this).next_exited.is_null() {
+                (*this).report_after = 0;
+                Self::push_exited(this);
             }
         }
-        // SAFETY: `_guard` keeps `this` live; `&mut` scoped to this call (which
-        // can fire the JS exit handler).
-        unsafe { (*this).on_wait_pid(waitpid_result, rusage) };
     }
 
-    /// # Safety
-    /// See [`Process::on_wait_pid_from_waiter_thread`].
+    /// The waiter thread reaped `task.subprocess`: queue the exit for `wait_children`.
     #[cfg(unix)]
-    pub unsafe fn on_wait_pid_from_event_loop_task(this: *mut Self) {
-        // SAFETY: caller contract — adopts the queued +1 ref.
-        let _guard = unsafe { RefPtr::from_raw(this) };
-        // SAFETY: `_guard` keeps `this` live.
-        unsafe { (*this).wait(false) };
+    unsafe fn mark_reaped(task: Box<waiter_thread_posix::ResultTask<Process>>) {
+        let this = task.subprocess;
+        // SAFETY: `this` is live on its loop's thread and holds the ref `append()` took.
+        unsafe {
+            debug_assert!((*this).next_exited.is_null());
+            // A task can run inside a tick whose batch was polled before the child died.
+            (*this).report_after = (*(*this).event_loop.platform_event_loop()).iteration_number();
+            (*this).reaped = Some(task);
+            Self::push_exited(this);
+        }
+    }
+
+    /// Append to its loop's list (circular, tail in the loop data), which takes over one ref.
+    #[cfg(unix)]
+    unsafe fn push_exited(this: *mut Self) {
+        // SAFETY: callers pass a live `this` that is not in the list; a loop outlives its processes.
+        unsafe {
+            let tail_slot = &raw mut (*(*this).event_loop.platform_event_loop())
+                .internal_loop_data
+                .exited_children;
+            let tail = (*tail_slot).cast::<Process>();
+            (*this).next_exited = if tail.is_null() {
+                this
+            } else {
+                (*tail).next_exited
+            };
+            if !tail.is_null() {
+                (*tail).next_exited = this;
+            }
+            *tail_slot = this.cast();
+        }
+    }
+
+    /// Unlink the oldest entry of `loop_`'s list that `which` accepts; its ref goes to the caller.
+    #[cfg(unix)]
+    unsafe fn take_exited(
+        loop_: *mut UwsLoop,
+        mut which: impl FnMut(*mut Process) -> bool,
+    ) -> Option<*mut Process> {
+        // SAFETY: `loop_` is this thread's live loop, and every entry holds a ref.
+        unsafe {
+            let tail_slot = &raw mut (*loop_).internal_loop_data.exited_children;
+            let tail = (*tail_slot).cast::<Process>();
+            if tail.is_null() {
+                return None;
+            }
+            let mut prev = tail;
+            loop {
+                let entry = (*prev).next_exited;
+                if which(entry) {
+                    if entry == prev {
+                        *tail_slot = core::ptr::null_mut();
+                    } else {
+                        (*prev).next_exited = (*entry).next_exited;
+                        if entry == tail {
+                            *tail_slot = prev.cast();
+                        }
+                    }
+                    (*entry).next_exited = core::ptr::null_mut();
+                    return Some(entry);
+                }
+                if entry == tail {
+                    return None;
+                }
+                prev = entry;
+            }
+        }
+    }
+
+    /// Report `loop_`'s queued exits one at a time: a handler can tick it again or close an entry.
+    #[cfg(unix)]
+    unsafe fn wait_children(loop_: *mut UwsLoop) {
+        // SAFETY: `loop_` is this thread's live loop; `_exit` keeps `this` live for its turn.
+        unsafe {
+            while let Some(this) = {
+                let iteration = (*loop_).iteration_number();
+                Self::take_exited(loop_, |entry| iteration > (*entry).report_after)
+            } {
+                let _exit = RefPtr::from_raw(this);
+                match (*this).reaped.take() {
+                    None => (*this).wait(false),
+                    Some(task) => {
+                        if let Poller::WaiterThread(waiter) = &mut (*this).poller {
+                            let ctx = event_loop_handle_to_ctx((*this).event_loop);
+                            waiter.unref(ctx);
+                            (*this).poller = Poller::Detached;
+                        }
+                        (*this).on_wait_pid(&task.result, &task.rusage);
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -618,6 +705,17 @@ impl Process {
     pub fn close(&mut self) {
         #[cfg(unix)]
         {
+            // A queued exit is not reported any more; the ref its entry held is released below.
+            let mut dequeued = false;
+            if !self.next_exited.is_null() {
+                let this: *mut Process = self;
+                // SAFETY: `this` is live and in the list of the loop it is watched on.
+                dequeued = unsafe {
+                    Self::take_exited(self.event_loop.platform_event_loop(), |entry| entry == this)
+                }
+                .is_some();
+                self.reaped = None;
+            }
             let mut stranded_watch_ref = false;
             // Route the `Fd` arm through the centralized `fd_poll_mut()`
             // accessor instead of open-coding `(*poll.as_ptr()).deinit()`.
@@ -628,7 +726,7 @@ impl Process {
                 waiter.disable();
             }
             self.poller = Poller::Detached;
-            if stranded_watch_ref && !self.has_exited() {
+            if dequeued || (stranded_watch_ref && !self.has_exited()) {
                 // SAFETY: callers hold their own +1, so this never drops to zero.
                 unsafe { Self::deref(std::ptr::from_mut(self)) };
             }
@@ -692,6 +790,8 @@ impl Process {
             // different root cause (poller is already Fd when `on_max_buffer`
             // fires, so this arm is unreachable on that path).
             match &self.poller {
+                // The waiter thread reaped it and the exit is queued: the pid is free for reuse.
+                Poller::WaiterThread(_) if self.reaped.is_some() => {}
                 Poller::WaiterThread(_) | Poller::Fd(_) => {
                     // All by-value `pid_t`/`c_int`; the kernel validates pid/
                     // signal and returns -1/errno (ESRCH/EINVAL/EPERM) — no
@@ -955,6 +1055,14 @@ impl PollerWindows {
     }
 }
 
+/// `us_internal_loop_post` calls this while the loop has queued child exits.
+#[cfg(unix)]
+#[unsafe(no_mangle)]
+extern "C" fn Bun__Process__waitChildren(loop_: *mut UwsLoop) {
+    // SAFETY: usockets passes the loop it is ticking, on that loop's thread.
+    unsafe { Process::wait_children(loop_) };
+}
+
 #[cfg(unix)]
 pub use waiter_thread_posix::WaiterThreadPosix as WaiterThread;
 
@@ -1052,16 +1160,9 @@ pub mod waiter_thread_posix {
             bun_core::heap::into_raw(Box::new(v))
         }
 
-        pub fn run_from_js_thread(self) {
-            self.run_from_main_thread();
-        }
-
-        pub(crate) fn run_from_main_thread(self) {
-            // SAFETY: subprocess strong-ref'd before append(); released by
-            // on_wait_pid_from_waiter_thread → deref().
-            unsafe {
-                T::on_wait_pid_from_waiter_thread(self.subprocess, &self.result, &self.rusage)
-            };
+        pub fn run_from_js_thread(self: Box<Self>) {
+            // SAFETY: subprocess strong-ref'd before append(); `exit_reaped` takes that ref over.
+            unsafe { T::exit_reaped(self) };
         }
     }
 
@@ -1081,10 +1182,13 @@ pub mod waiter_thread_posix {
         }
 
         pub(crate) fn run_from_main_thread(self) {
-            let result = self.result;
-            let subprocess = self.subprocess;
-            // SAFETY: see ResultTask::run_from_main_thread.
-            unsafe { T::on_wait_pid_from_waiter_thread(subprocess, &result, &rusage_zeroed()) };
+            let task = Box::new(ResultTask {
+                result: self.result,
+                subprocess: self.subprocess,
+                rusage: rusage_zeroed(),
+            });
+            // SAFETY: see ResultTask::run_from_js_thread.
+            unsafe { T::exit_reaped(task) };
         }
 
         /// Stored thunk for `AnyTaskWithExtraContext` (`fn(*mut T, *mut C)`
@@ -1113,12 +1217,10 @@ pub mod waiter_thread_posix {
         /// `this` is a live, strong-ref'd pointer; callee releases one ref.
         unsafe fn release_ref_from_waiter_thread(this: *mut Self);
         /// # Safety
-        /// `this` must be a live, strong-ref'd pointer; callee releases one ref.
-        unsafe fn on_wait_pid_from_waiter_thread(
-            this: *mut Self,
-            result: &bun_sys::Result<WaitPidResult>,
-            rusage: &Rusage,
-        );
+        /// `task.subprocess` must be a live, strong-ref'd pointer; callee takes that ref over.
+        unsafe fn exit_reaped(task: Box<ResultTask<Self>>)
+        where
+            Self: Sized;
     }
 
     impl ProcessLike for Process {
@@ -1141,13 +1243,9 @@ pub mod waiter_thread_posix {
             unsafe { Process::deref(this) };
         }
         #[inline]
-        unsafe fn on_wait_pid_from_waiter_thread(
-            this: *mut Self,
-            result: &bun_sys::Result<WaitPidResult>,
-            rusage: &Rusage,
-        ) {
+        unsafe fn exit_reaped(task: Box<ResultTask<Self>>) {
             // SAFETY: caller contract.
-            unsafe { Process::on_wait_pid_from_waiter_thread(this, result, rusage) };
+            unsafe { Process::mark_reaped(task) };
         }
     }
 

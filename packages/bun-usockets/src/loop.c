@@ -418,6 +418,11 @@ void us_internal_loop_pre(struct us_loop_t *loop) {
     if (loop->data.nq_head) us_nq_loop_flush_if_pending(loop);
 }
 
+#ifndef LIBUS_USE_LIBUV
+/* src/spawn/process.rs */
+extern void Bun__Process__waitChildren(struct us_loop_t *loop);
+#endif
+
 void us_internal_loop_post(struct us_loop_t *loop) {
     us_internal_handle_dns_results(loop);
 #ifdef LIBUS_USE_QUIC
@@ -433,6 +438,11 @@ void us_internal_loop_post(struct us_loop_t *loop) {
         us_internal_free_closed_sockets(loop);
     }
     loop->data.post_cb(loop);
+#ifndef LIBUS_USE_LIBUV
+    /* Last, like libuv's uv__wait_children: what a child wrote before it died was read above.
+     * At every tick depth, because a nested tick can be waiting for one of these exits. */
+    if (loop->data.exited_children) Bun__Process__waitChildren(loop);
+#endif
 }
 
 #ifdef WIN32
