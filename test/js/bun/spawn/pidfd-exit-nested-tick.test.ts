@@ -20,12 +20,15 @@
 // Fix: register the pidfd level-triggered (no EPOLLONESHOT). A pidfd stays
 // readable from process exit until close, so a dropped ready_polls slot is
 // harmless — the next epoll_wait returns it again.
+//
+// Exits are now queued while the batch is dispatched and reported after it,
+// so onExit no longer runs mid-batch. What this test holds today: the nested
+// tick inside the first onExit reports the exits that are still queued, on
+// kqueue too, where the process event is one-shot.
 import { expect, test } from "bun:test";
-import { isLinux } from "harness";
+import { isWindows } from "harness";
 
-// pidfd path is Linux-only; macOS/FreeBSD use EVFILT_PROC which is keyed
-// on pid and auto-removed by the kernel when the process is reaped.
-test.skipIf(!isLinux)(
+test.skipIf(isWindows)(
   "subprocess pidfd exit survives nested event-loop tick dropping its ready_polls slot",
   async () => {
     // Spawn a batch of short-lived children with stdio ignored so the pidfd
@@ -65,5 +68,6 @@ test.skipIf(!isLinux)(
     // whose events were dropped never fire onExit and this await hangs until
     // the test's own 5s timeout — there is no other wake source.
     await Promise.all(exits);
+    expect(nested).toBe(true);
   },
 );

@@ -19,6 +19,7 @@ import {
 } from "harness";
 import { closeSync, fstatSync, openSync, readFileSync, readSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import path, { join } from "path";
+import { blockUntilDead, blockUntilExitsArePosted } from "../../node/child_process/fixtures/block-until-dead.js";
 
 let tmp: string;
 
@@ -608,6 +609,120 @@ for (let [gcTick, label] of [
     });
   });
 }
+
+// A child's exit is reported after the other I/O of the poll batch that carried it, as libuv
+// does, so what a child wrote before it died is read before its onExit runs. The two children
+// die one after the other while this process stays off its event loop, so the output and the
+// exits of both arrive in one batch. The waiter-thread re-run below covers the other way bun
+// learns of an exit, which used to report it before the loop polled at all.
+describe.skipIf(isWindows)("children that died in one batch", () => {
+  function twoChildren(events: string[], onExit: (name: string) => void = () => {}) {
+    const dir = tempDir("spawn-exit-after-output", {});
+    const children = ["a", "b"].map(name => {
+      const goFile = join(String(dir), name);
+      const reported = Promise.withResolvers<void>();
+      const proc = spawn({
+        cmd: ["/bin/sh", "-c", `while [ ! -e "$0" ]; do sleep 0.01; done; printf %s "$1"`, goFile, name],
+        stdio: ["ignore", "pipe", "inherit"],
+        onExit(_proc, exitCode) {
+          events.push(`${name}:exit:${exitCode}`);
+          onExit(name);
+          reported.resolve();
+        },
+      });
+      const output = (async () => {
+        for await (const chunk of proc.stdout) events.push(`${name}:chunk:${Buffer.from(chunk)}`);
+      })();
+      return { proc, goFile, done: Promise.all([reported.promise, output]) };
+    });
+    // From a timer: the reads above are pending by then, and after its timers the loop runs its
+    // tasks (where the waiter thread's exits arrive) before it polls again.
+    setTimeout(() => {
+      for (const { proc, goFile } of children) {
+        writeFileSync(goFile, "");
+        blockUntilDead(proc.pid);
+      }
+      blockUntilExitsArePosted();
+    }, 0);
+    return { children, [Symbol.dispose]: () => dir[Symbol.dispose]() };
+  }
+
+  it("the output of every child is read before the onExit of any", async () => {
+    const events: string[] = [];
+    using both = twoChildren(events);
+    await Promise.all(both.children.map(child => child.done));
+    // Which child comes first is not fixed.
+    expect(events.toSorted()).toEqual(["a:chunk:a", "a:exit:0", "b:chunk:b", "b:exit:0"]);
+    expect(events.map(event => event.split(":")[1])).toEqual(["chunk", "chunk", "exit", "exit"]);
+  });
+
+  it("a Worker that exits with exits still to report shuts down cleanly", async () => {
+    using dir = tempDir("spawn-exit-queued-worker", {
+      "worker.js": /* js */ `
+        const { writeFileSync } = require("node:fs");
+        const { join } = require("node:path");
+        const { blockUntilDead, blockUntilExitsArePosted } = require(process.env.BLOCK_UNTIL_DEAD);
+        const children = ["a", "b"].map(name => {
+          const goFile = join(__dirname, name);
+          const proc = Bun.spawn({
+            cmd: ["/bin/sh", "-c", 'while [ ! -e "$0" ]; do sleep 0.01; done; printf %s "$1"', goFile, name],
+            stdio: ["ignore", "pipe", "inherit"],
+          });
+          return { proc, goFile };
+        });
+        let chunks = 0;
+        for (const { proc } of children) {
+          (async () => {
+            for await (const chunk of proc.stdout) {
+              if (++chunks < children.length) continue;
+              // Both children are dead and all their output is read; no exit is reported yet.
+              postMessage(children.map(child => child.proc.exitCode));
+              process.exit(0);
+            }
+          })();
+        }
+        setTimeout(() => {
+          for (const { proc, goFile } of children) {
+            writeFileSync(goFile, "");
+            blockUntilDead(proc.pid);
+          }
+          blockUntilExitsArePosted();
+        }, 0);
+      `,
+      "main.js": /* js */ `
+        const worker = new Worker(require("node:path").join(__dirname, "worker.js"));
+        worker.onmessage = event => console.log(JSON.stringify(event.data));
+        worker.addEventListener("close", event => console.log("worker exited with", event.code));
+      `,
+    });
+    await using proc = spawn({
+      cmd: [bunExe(), "main.js"],
+      cwd: String(dir),
+      env: { ...bunEnv, BLOCK_UNTIL_DEAD: require.resolve("../../node/child_process/fixtures/block-until-dead.js") },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "[null,null]\nworker exited with 0\n",
+      stderr: "",
+      exitCode: 0,
+    });
+  });
+
+  it("kill() of a child whose exit is not reported yet leaves that report alone", async () => {
+    const events: string[] = [];
+    using both = twoChildren(events, name => {
+      for (const { proc } of both.children) proc.kill();
+      events.push(`${name}:killed-both`);
+    });
+    await Promise.all(both.children.map(child => child.done));
+    expect(events.filter(event => event.includes(":exit:")).toSorted()).toEqual(["a:exit:0", "b:exit:0"]);
+    expect(both.children.map(({ proc }) => [proc.exitCode, proc.signalCode])).toEqual([
+      [0, null],
+      [0, null],
+    ]);
+  });
+});
 
 // The waiter thread is the Linux fallback for kernels/sandboxes without pidfd;
 // kqueue platforms (macOS, FreeBSD) always have EVFILT_PROC and its non-Linux

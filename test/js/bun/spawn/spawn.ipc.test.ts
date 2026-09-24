@@ -1,7 +1,9 @@
 import { spawn } from "bun";
 import { describe, expect, it } from "bun:test";
-import { bunEnv, bunExe, gcTick, isWindows } from "harness";
+import { bunEnv, bunExe, gcTick, isLinux, isWindows } from "harness";
 import path from "path";
+
+const blockUntilDeadPath = path.join(__dirname, "../../node/child_process/fixtures/block-until-dead.js");
 
 describe.each(["advanced", "json"])("ipc mode %s", mode => {
   it("the subprocess should be defined and the child should send", done => {
@@ -119,6 +121,52 @@ describe.each(["advanced", "json"])("ipc mode %s", mode => {
           ? { name: "TypeError", message: "JSON.stringify cannot serialize cyclic structures." }
           : { name: "DataCloneError", message: "The object can not be cloned." },
     });
+  });
+
+  // A child's exit is reported after the other I/O of the poll batch that carried it, so a
+  // message the child sent right before it exited arrives, and arrives before onExit. The parent
+  // stays off its event loop until the child is dead, so the message and the exit are both
+  // pending when it returns. The waiter thread (no pidfd_open: gVisor, seccomp filters, kernels
+  // before 5.6) used to post the exit as a task, which ran before the channel was read and
+  // closed it over the message (#37849).
+  it.skipIf(isWindows)("delivers a message the child sent right before it exited, before onExit", async () => {
+    const parent = /* js */ `
+      const { blockUntilDead, blockUntilExitsArePosted } = require(${JSON.stringify(blockUntilDeadPath)});
+      const events = [];
+      const reported = Promise.withResolvers();
+      const child = Bun.spawn({
+        cmd: [process.execPath, "-e", 'process.send("last"); Promise.resolve().then(() => process.exit(0));'],
+        stdio: ["ignore", "inherit", "inherit"],
+        serialization: ${JSON.stringify(mode)},
+        ipc(message) {
+          events.push("message:" + message);
+        },
+        onExit() {
+          events.push("exit");
+          reported.resolve();
+        },
+      });
+      blockUntilDead(child.pid);
+      blockUntilExitsArePosted();
+      await reported.promise;
+      console.log(JSON.stringify(events));
+    `;
+    async function events(env: Record<string, string>) {
+      await using proc = spawn({
+        cmd: [bunExe(), "-e", parent],
+        env: { ...bunEnv, ...env },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+      return { stdout: stdout.trim(), stderr, exitCode };
+    }
+    const expected = { stdout: JSON.stringify(["message:last", "exit"]), stderr: "", exitCode: 0 };
+    // bunEnv sets BUN_GARBAGE_COLLECTOR_LEVEL, without which the waiter thread flag is not read.
+    const [pidfd, waiterThread] = await Promise.all([
+      events({}),
+      isLinux ? events({ BUN_FEATURE_FLAG_FORCE_WAITER_THREAD: "1" }) : expected,
+    ]);
+    expect({ pidfd, waiterThread }).toEqual({ pidfd: expected, waiterThread: expected });
   });
 });
 
