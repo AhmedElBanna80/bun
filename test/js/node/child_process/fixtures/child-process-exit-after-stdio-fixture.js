@@ -1,6 +1,7 @@
 // The parent process of child-process-exit-after-stdio.test.ts. It runs the scenario named by its
-// argument and prints the order of the events it saw as JSON. It uses node APIs only, so it also
-// runs under node.
+// first argument and prints the order of the events it saw as JSON. The second argument is a
+// directory for its go-files, which the test owns. It uses node APIs only, so it also runs under
+// node.
 //
 // In each scenario the parent stays off its event loop until the children are dead. What they
 // wrote and their exits are then all pending when the parent returns to its loop, and all of it
@@ -9,18 +10,14 @@
 const { execSync, fork, spawn } = require("node:child_process");
 const { once } = require("node:events");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 const { blockUntilDead, blockUntilExitsArePosted } = require("./block-until-dead.js");
 
-let tmpdir;
-process.on("exit", () => tmpdir && fs.rmSync(tmpdir, { recursive: true, force: true }));
-
+const tmpdir = process.argv[3];
 let goFiles = 0;
 
 // A child that waits for its go-file, writes `text` to `fd`, and exits.
 function writer(fd, text, stdio) {
-  tmpdir ??= fs.mkdtempSync(path.join(os.tmpdir(), "exit-after-stdio-"));
   const goFile = path.join(tmpdir, `go-${goFiles++}`);
   const script = `while [ ! -e "$0" ]; do sleep 0.01; done; printf %s "$1" >&${fd}`;
   const child = spawn("/bin/sh", ["-c", script, goFile, text], { stdio });

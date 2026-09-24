@@ -10,12 +10,19 @@
  */
 import assert from "node:assert";
 import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { describe, test } from "node:test";
+import { after, describe, test } from "node:test";
 import { promisify } from "node:util";
 
 const execFileP = promisify(execFile);
 const fixture = path.join(import.meta.dirname, "fixtures", "child-process-exit-after-stdio-fixture.js");
+
+// The go-files of every fixture run. Not `tempDir` from harness: this file also runs under node.
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "exit-after-stdio-"));
+after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+let runs = 0;
 
 const transports = [{ name: "default", env: {} }];
 if (process.versions.bun && process.platform === "linux") {
@@ -30,18 +37,17 @@ if (process.versions.bun && process.platform === "linux") {
   });
 }
 
-const runInWorker = `new (require("node:worker_threads").Worker)(process.argv[1], { argv: [process.argv[2]] })`;
+const runInWorker = `new (require("node:worker_threads").Worker)(process.argv[1], { argv: process.argv.slice(2) })`;
 
 for (const { name, env } of transports) {
   describe(`exit notification: ${name}`, { skip: process.platform === "win32" }, () => {
     async function events(scenario, { worker = false } = {}) {
-      const { stdout } = await execFileP(
-        process.execPath,
-        [...(worker ? ["-e", runInWorker] : []), fixture, scenario],
-        {
-          env: { ...process.env, BUN_DEBUG_QUIET_LOGS: "1", ...env },
-        },
-      );
+      const dir = path.join(tmp, String(runs++));
+      fs.mkdirSync(dir);
+      const args = [...(worker ? ["-e", runInWorker] : []), fixture, scenario, dir];
+      const { stdout } = await execFileP(process.execPath, args, {
+        env: { ...process.env, BUN_DEBUG_QUIET_LOGS: "1", ...env },
+      });
       return JSON.parse(stdout);
     }
 
