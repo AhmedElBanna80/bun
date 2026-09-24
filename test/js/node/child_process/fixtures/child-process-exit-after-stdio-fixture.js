@@ -13,18 +13,14 @@ const os = require("node:os");
 const path = require("node:path");
 const { blockUntilDead, blockUntilExitsArePosted } = require("./block-until-dead.js");
 
-if (process.argv[2] === "forkChild") {
-  process.send("last", () => process.exit(0));
-  return;
-}
-
-const tmpdir = fs.mkdtempSync(path.join(os.tmpdir(), "exit-after-stdio-"));
-process.on("exit", () => fs.rmSync(tmpdir, { recursive: true, force: true }));
+let tmpdir;
+process.on("exit", () => tmpdir && fs.rmSync(tmpdir, { recursive: true, force: true }));
 
 let goFiles = 0;
 
 // A child that waits for its go-file, writes `text` to `fd`, and exits.
 function writer(fd, text, stdio) {
+  tmpdir ??= fs.mkdtempSync(path.join(os.tmpdir(), "exit-after-stdio-"));
   const goFile = path.join(tmpdir, `go-${goFiles++}`);
   const script = `while [ ! -e "$0" ]; do sleep 0.01; done; printf %s "$1" >&${fd}`;
   const child = spawn("/bin/sh", ["-c", script, goFile, text], { stdio });
@@ -111,4 +107,5 @@ const scenarios = {
   },
 };
 
-scenarios[process.argv[2]]().then(events => console.log(JSON.stringify(events)));
+if (process.argv[2] === "forkChild") process.send("last", () => process.exit(0));
+else scenarios[process.argv[2]]().then(events => console.log(JSON.stringify(events)));
