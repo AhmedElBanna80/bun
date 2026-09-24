@@ -389,12 +389,9 @@ impl Process {
         }
     }
 
-    /// Unlink the oldest entry of `loop_`'s list that `which` accepts; its ref goes to the caller.
+    /// Unlink the oldest entry of `loop_`'s list that may be reported now; its ref goes to the caller.
     #[cfg(unix)]
-    unsafe fn take_exited(
-        loop_: *mut UwsLoop,
-        mut which: impl FnMut(*mut Process) -> bool,
-    ) -> Option<*mut Process> {
+    unsafe fn take_reportable(loop_: *mut UwsLoop) -> Option<*mut Process> {
         // SAFETY: `loop_` is this thread's live loop, and every entry holds a ref.
         unsafe {
             let tail_slot = &raw mut (*loop_).internal_loop_data.exited_children;
@@ -402,10 +399,11 @@ impl Process {
             if tail.is_null() {
                 return None;
             }
+            let iteration = (*loop_).iteration_number();
             let mut prev = tail;
             loop {
                 let entry = (*prev).next_exited;
-                if which(entry) {
+                if iteration > (*entry).report_after {
                     if entry == prev {
                         *tail_slot = core::ptr::null_mut();
                     } else {
@@ -425,15 +423,37 @@ impl Process {
         }
     }
 
+    /// Unlink `self` from its loop's list. Only other entries are reached through the list.
+    #[cfg(unix)]
+    fn unlink_exited(&mut self) {
+        let this: *mut Process = self;
+        let next = core::mem::replace(&mut self.next_exited, core::ptr::null_mut());
+        // SAFETY: `self` was in the list of its live loop, and every entry holds a ref.
+        unsafe {
+            let tail_slot = &raw mut (*self.event_loop.platform_event_loop())
+                .internal_loop_data
+                .exited_children;
+            if next == this {
+                *tail_slot = core::ptr::null_mut();
+                return;
+            }
+            let mut prev = next;
+            while (*prev).next_exited != this {
+                prev = (*prev).next_exited;
+            }
+            (*prev).next_exited = next;
+            if (*tail_slot).cast::<Process>() == this {
+                *tail_slot = prev.cast();
+            }
+        }
+    }
+
     /// Report `loop_`'s queued exits one at a time: a handler can tick it again or close an entry.
     #[cfg(unix)]
     unsafe fn wait_children(loop_: *mut UwsLoop) {
         // SAFETY: `loop_` is this thread's live loop; `_exit` keeps `this` live for its turn.
         unsafe {
-            while let Some(this) = {
-                let iteration = (*loop_).iteration_number();
-                Self::take_exited(loop_, |entry| iteration > (*entry).report_after)
-            } {
+            while let Some(this) = Self::take_reportable(loop_) {
                 let _exit = RefPtr::from_raw(this);
                 match (*this).reaped.take() {
                     None => (*this).wait(false),
@@ -706,14 +726,9 @@ impl Process {
         #[cfg(unix)]
         {
             // A queued exit is not reported any more; the ref its entry held is released below.
-            let mut dequeued = false;
-            if !self.next_exited.is_null() {
-                let this: *mut Process = self;
-                // SAFETY: `this` is live and in the list of the loop it is watched on.
-                dequeued = unsafe {
-                    Self::take_exited(self.event_loop.platform_event_loop(), |entry| entry == this)
-                }
-                .is_some();
+            let dequeued = !self.next_exited.is_null();
+            if dequeued {
+                self.unlink_exited();
                 self.reaped = None;
             }
             let mut stranded_watch_ref = false;
@@ -1090,7 +1105,7 @@ pub mod waiter_thread_posix {
         pub(crate) queue: ConcurrentQueue<T>,
         // The active list holds raw `*T` whose strong ref was taken
         // by the caller before `append()` (Process::watch does `self.ref_()`).
-        // The matching `deref()` happens in `on_wait_pid_from_waiter_thread`.
+        // The matching `deref()` happens when `Process::wait_children` reports the exit.
         //
         // `UnsafeCell` so `loop_` can take `&self`: the waiter thread is the
         // *sole* mutator of `active`, but producers concurrently hold `&self`
@@ -1201,7 +1216,7 @@ pub mod waiter_thread_posix {
     }
 
     /// Trait abstracting `process.pid` / `process.event_loop` /
-    /// `process.onWaitPidFromWaiterThread` for generic `T` (only `Process`
+    /// `Process::mark_reaped` for generic `T` (only `Process`
     /// today).
     pub trait ProcessLike: 'static {
         /// `jsc::Task` tag for this `T`'s `ResultTask`; callers supply it.
@@ -1290,7 +1305,7 @@ pub mod waiter_thread_posix {
                 let process = active[i];
                 // SAFETY: each `*mut T` in `active` was strong-ref'd by the
                 // producer (`Process::watch` → `ref_()`) before `append()`;
-                // the matching `deref()` is in `on_wait_pid_from_waiter_thread`,
+                // the matching `deref()` is in `Process::wait_children` (or `close`),
                 // so the pointee outlives this shared borrow. Single deref
                 // serves both `pid()` and `event_loop()` accessor reads.
                 let process_ref = unsafe { &*process };
