@@ -1597,6 +1597,17 @@ impl<'a> Resolver<'a> {
                     true => PackageLookup::Unknown,
                     false => self.look_in_executable(source_dir, import_path, kind),
                 };
+                if std::env::var_os("KNEXT_DBG").is_some() {
+                    eprintln!(
+                        "[knext-dbg] gate import={:?} source_dir={:?} embedded_hidden={} embedded_found={} compiled_program={} custom_paths={}",
+                        String::from_utf8_lossy(import_path),
+                        String::from_utf8_lossy(source_dir),
+                        embedded == PackageLookup::Hidden,
+                        matches!(embedded, PackageLookup::Found(_)),
+                        graph.compiled_program().is_some(),
+                        self.custom_dir_paths.is_some()
+                    );
+                }
                 if embedded == PackageLookup::Hidden {
                     self.extension_order = original_order;
                     return ResultUnion::NotFound;
@@ -1615,17 +1626,36 @@ impl<'a> Resolver<'a> {
                     if graph.compiled_program().is_none()
                         && (specifier_is_embedded_path || self.custom_dir_paths.is_none())
                     {
-                        let embedded_source_dir = if ::bun_options_types::standalone_path::is_bun_standalone_file_path(source_dir) {
-                            source_dir
-                        } else {
-                            Fs::FileSystem::get().top_level_dir()
-                        };
-                        match self.resolve_without_symlinks(
+                        let embedded_source_dir =
+                            if ::bun_options_types::standalone_path::is_bun_standalone_file_path(
+                                source_dir,
+                            ) {
+                                source_dir
+                            } else {
+                                Fs::FileSystem::get().top_level_dir()
+                            };
+                        let embedded_outcome = self.resolve_without_symlinks(
                             embedded_source_dir,
                             import_path,
                             kind,
                             global_cache,
-                        ) {
+                        );
+                        if std::env::var_os("KNEXT_DBG").is_some() {
+                            match &embedded_outcome {
+                                ResultUnion::Success(r) => eprintln!(
+                                    "[knext-dbg] embedded pass from {:?}: Success {:?} external={}",
+                                    String::from_utf8_lossy(embedded_source_dir),
+                                    String::from_utf8_lossy(r.path_pair.primary.text()),
+                                    r.flags.is_external()
+                                ),
+                                ResultUnion::NotFound => eprintln!(
+                                    "[knext-dbg] embedded pass from {:?}: NotFound",
+                                    String::from_utf8_lossy(embedded_source_dir)
+                                ),
+                                _ => eprintln!("[knext-dbg] embedded pass: Failure/other"),
+                            }
+                        }
+                        match embedded_outcome {
                             ResultUnion::Success(result)
                                 if ::bun_options_types::standalone_path::is_bun_standalone_file_path(
                                     result.path_pair.primary.text(),
