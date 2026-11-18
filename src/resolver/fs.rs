@@ -373,9 +373,52 @@ impl DirEntry {
         entry: &bun_sys::dir_iterator::IteratorResult<'_>,
         filename_store: &mut FilenameStoreAppender,
     ) -> crate::CrateResult<Option<&Entry>> {
+        // `entry.name.slice()` is OS-native (`&[u16]` on Windows); the
+        // entry-store / hashmap key in `data` is UTF-8, so use the eagerly-
+        // transcoded `slice_u8()`.
+        self.add_entry_named(prev_map, entry.name.slice_u8(), entry.kind, filename_store)
+    }
+
+    /// Lists the embedded directory `self.dir` into `self`: `false` when the graph has no such directory.
+    pub(crate) fn add_entries_from_standalone_graph(
+        &mut self,
+        mut prev_map: Option<&mut dir_entry::EntryMap>,
+        graph: &dyn crate::StandaloneModuleGraph,
+    ) -> crate::CrateResult<bool> {
+        let dir = self.dir;
+        let mut filename_store = FilenameStoreAppender::new();
+        let mut failed: Option<crate::Error> = None;
+        let found = graph.for_each_dir_entry(dir, &mut |name, is_dir| {
+            if failed.is_some() {
+                return;
+            }
+            let kind = if is_dir {
+                bun_sys::FileKind::Directory
+            } else {
+                bun_sys::FileKind::File
+            };
+            if let Err(err) =
+                self.add_entry_named(prev_map.as_deref_mut(), name, kind, &mut filename_store)
+            {
+                failed = Some(err);
+            }
+        });
+        match failed {
+            Some(err) => Err(err),
+            None => Ok(found),
+        }
+    }
+
+    /// Returns the stored entry, or `None` for a kind that is not kept (a device, a socket, ...).
+    pub(crate) fn add_entry_named(
+        &mut self,
+        prev_map: Option<&mut dir_entry::EntryMap>,
+        name_slice: &[u8],
+        kind: bun_sys::FileKind,
+        filename_store: &mut FilenameStoreAppender,
+    ) -> crate::CrateResult<Option<&Entry>> {
         use bun_sys::FileKind as DK;
-        let name_slice = entry.name.slice_u8();
-        let found_kind: Option<EntryKind> = match entry.kind {
+        let found_kind: Option<EntryKind> = match kind {
             DK::Directory => Some(EntryKind::Dir),
             DK::File => Some(EntryKind::File),
 

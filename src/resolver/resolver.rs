@@ -1571,12 +1571,16 @@ impl<'a> Resolver<'a> {
             Ok(None) => {}
         }
 
-        // When using `bun build --compile`, module resolution is never
-        // relative to our special /$bunfs/ directory.
-        //
-        // It's always relative to the current working directory of the project root.
-        //
-        // ...unless you pass a relative path that exists in the standalone module graph executable.
+        // A path with a null byte cannot exist on the filesystem. Continuing
+        // anyways would cause assertion failures.
+        if strings::index_of_char(import_path, 0).is_some() {
+            let _ = self.flush_debug_logs(FlushMode::Fail);
+            self.extension_order = original_order;
+            return ResultUnion::NotFound;
+        }
+
+        // `bun build --compile`: the embedded module graph first (the graph's own lookup, then the
+        // resolver's algorithm over the embedded tree), then the cwd on disk.
         let mut source_dir_resolver = bun_paths::PosixToWinNormalizer::default();
         let importer_directory: Vec<u8>;
         let mut looks_beside_source = false;
@@ -1606,6 +1610,59 @@ impl<'a> Resolver<'a> {
                 if specifier_is_embedded_path
                     || ::bun_options_types::standalone_path::is_bun_standalone_file_path(source_dir)
                 {
+                    // A program that `bun build --compile` made without a compiled-program record: the resolver's own algorithm
+                    // over the embedded tree (`node_modules`, `package.json` `exports`, `imports`), as it runs over a tree on disk.
+                    if graph.compiled_program().is_none()
+                        && (specifier_is_embedded_path || self.custom_dir_paths.is_none())
+                    {
+                        let embedded_source_dir = if ::bun_options_types::standalone_path::is_bun_standalone_file_path(source_dir) {
+                            source_dir
+                        } else {
+                            Fs::FileSystem::get().top_level_dir()
+                        };
+                        match self.resolve_without_symlinks(
+                            embedded_source_dir,
+                            import_path,
+                            kind,
+                            global_cache,
+                        ) {
+                            ResultUnion::Success(result)
+                                if ::bun_options_types::standalone_path::is_bun_standalone_file_path(
+                                    result.path_pair.primary.text(),
+                                ) =>
+                            {
+                                // The module loader keys on the graph's own name.
+                                let found =
+                                    graph.find_assume_standalone_path(result.path_pair.primary.text());
+                                self.extension_order = original_order;
+                                return match found {
+                                    Some(file_name) => {
+                                        let _ = self.flush_debug_logs(FlushMode::Success);
+                                        ResultUnion::Success(Self::result_of_module_in_executable(
+                                            file_name, kind,
+                                        ))
+                                    }
+                                    None => {
+                                        let _ = self.flush_debug_logs(FlushMode::Fail);
+                                        ResultUnion::NotFound
+                                    }
+                                };
+                            }
+                            // An embedded package.json mapped the specifier to a builtin or an external.
+                            ResultUnion::Success(result) if result.flags.is_external() => {
+                                let _ = self.flush_debug_logs(FlushMode::Success);
+                                self.extension_order = original_order;
+                                return ResultUnion::Success(result);
+                            }
+                            ResultUnion::Failure(err) => {
+                                let _ = self.flush_debug_logs(FlushMode::Fail);
+                                self.extension_order = original_order;
+                                return ResultUnion::Failure(err);
+                            }
+                            // Not embedded: the cwd pass below.
+                            _ => {}
+                        }
+                    }
                     if specifier_is_embedded_path
                         || self.looks_in_executable_alone(source_dir, import_path)
                     {
@@ -1670,14 +1727,6 @@ impl<'a> Resolver<'a> {
                 Err(_) => panic!("Failed to query CWD"),
             };
         };
-
-        // A path with a null byte cannot exist on the filesystem. Continuing
-        // anyways would cause assertion failures.
-        if strings::index_of_char(import_path, 0).is_some() {
-            let _ = self.flush_debug_logs(FlushMode::Fail);
-            self.extension_order = original_order;
-            return ResultUnion::NotFound;
-        }
 
         let mut tmp =
             self.resolve_without_symlinks(source_dir_normalized, import_path, kind, global_cache);
@@ -2798,6 +2847,10 @@ impl<'a> Resolver<'a> {
     pub fn bust_dir_cache_in(fs: &mut Fs::file_system::RealFS, path: &[u8]) -> bool {
         let path = strings::without_trailing_slash_windows_path(path);
         Self::assert_valid_cache_key(path);
+        // An embedded directory never changes, so there is nothing to re-read.
+        if Fs::standalone_graph_for_dir(path).is_some() {
+            return false;
+        }
         let first_bust = fs.bust_entries_cache(path);
         // SAFETY: the never-freed singleton of `dir_cache_mut`. Other threads can hold it too:
         // `remove` touches nothing of the map before it takes the map's mutex.
@@ -4758,8 +4811,16 @@ impl<'a> Resolver<'a> {
             let queue_top_safe_path = queue_top.safe_path;
             queue_slice_len -= 1;
 
+            // A directory of the embedded module graph: no fd, its entries are listed from the graph below.
+            let embedded_graph = if queue_top.fd.is_valid() {
+                None
+            } else {
+                Fs::standalone_graph_for_dir(queue_top_unsafe_path)
+            };
             let open_dir: FD = if queue_top.fd.is_valid() {
                 queue_top.fd
+            } else if embedded_graph.is_some() {
+                FD::INVALID
             } else {
                 'open_dir: {
                     // This saves us N copies of .toPosixPath
@@ -4822,12 +4883,16 @@ impl<'a> Resolver<'a> {
                             // A permission-denied ancestor (sandboxed drive roots, x-only
                             // shared dirs) is treated as opaque and empty, like the
                             // ENOTDIR tolerance; the requested directory itself stays fatal.
+                            // So is a missing ancestor of an embedded path (`B:` on Windows).
                             if queue_slice_len > 0
-                                && matches!(
+                                && (matches!(
                                     err,
                                     crate::Error::Sys(bun_errno::SystemErrno::EPERM)
                                         | crate::Error::Sys(bun_errno::SystemErrno::EACCES)
-                                )
+                                ) || (err == crate::Error::Sys(bun_errno::SystemErrno::ENOENT)
+                                    && ::bun_options_types::standalone_path::is_bun_standalone_file_path(
+                                        &path[..input_path_len],
+                                    )))
                             {
                                 debuglog!(
                                     "treating permission-denied ancestor \"{}\" as empty: {}",
@@ -4985,6 +5050,16 @@ impl<'a> Resolver<'a> {
                             )
                             .expect("unreachable");
                     }
+                } else if let Some(graph) = embedded_graph
+                    && !new_entry.add_entries_from_standalone_graph(
+                        // SAFETY: see block-wide note above.
+                        in_place.map(|existing| unsafe { &mut (*existing).data }),
+                        graph,
+                    )?
+                {
+                    self.dir_cache_mut().mark_not_found(queue_top.result);
+                    rfs!().entries.mark_not_found(cached_dir_entry_result);
+                    return Ok(None);
                 }
                 if let Some(existing) = in_place {
                     // SAFETY: see block-wide note above.

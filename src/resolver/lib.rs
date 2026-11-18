@@ -862,6 +862,47 @@ pub mod fs {
     /// The active filesystem backend (always the real filesystem).
     pub(crate) type Implementation = RealFS;
 
+    /// The compiled executable's embedded files, mounted at `/$bunfs/`: `read_directory` and
+    /// `read_file_with_allocator` serve paths under it from here, never from disk.
+    static STANDALONE_MODULE_GRAPH: std::sync::OnceLock<&'static dyn crate::StandaloneModuleGraph> =
+        std::sync::OnceLock::new();
+
+    /// See [`STANDALONE_MODULE_GRAPH`].
+    pub fn mount_standalone_module_graph(graph: &'static dyn crate::StandaloneModuleGraph) {
+        let _ = STANDALONE_MODULE_GRAPH.set(graph);
+    }
+
+    /// The mounted graph, if this process is a compiled executable. Any thread.
+    #[inline]
+    pub fn standalone_module_graph() -> Option<&'static dyn crate::StandaloneModuleGraph> {
+        STANDALONE_MODULE_GRAPH.get().copied()
+    }
+
+    /// The mounted graph, if `path` is a directory it serves (see [`STANDALONE_MODULE_GRAPH`]).
+    #[inline]
+    pub(crate) fn standalone_graph_for_dir(
+        path: &[u8],
+    ) -> Option<&'static dyn crate::StandaloneModuleGraph> {
+        let graph = *STANDALONE_MODULE_GRAPH.get()?;
+        // A program compiled ahead of time keeps the files it was given off the disk by its own record.
+        if graph.compiled_program().is_some() {
+            return None;
+        }
+        bun_options_types::standalone_path::is_bun_standalone_dir_path(path).then_some(graph)
+    }
+
+    /// The bytes of the embedded file `path`, if the mounted graph has it (see [`STANDALONE_MODULE_GRAPH`]).
+    #[inline]
+    pub(crate) fn standalone_file_contents(path: &[u8]) -> Option<&'static [u8]> {
+        let graph = *STANDALONE_MODULE_GRAPH.get()?;
+        if graph.compiled_program().is_some()
+            || !bun_options_types::standalone_path::is_bun_standalone_file_path(path)
+        {
+            return None;
+        }
+        graph.file_contents(path)
+    }
+
     // ── RealFS ───────────────────────────────────────────────────────────
 
     /// Real-filesystem backend: directory-entry cache plus fd-limit
@@ -989,6 +1030,20 @@ pub mod fs {
             Ok(dir)
         }
 
+        /// `readdir` for a directory of the mounted embedded graph: `ENOENT` when the graph has no such directory.
+        fn readdir_embedded(
+            prev_map: Option<&mut dir_entry::EntryMap>,
+            dir_: &'static [u8],
+            generation: Generation,
+            graph: &dyn crate::StandaloneModuleGraph,
+        ) -> crate::CrateResult<DirEntry> {
+            let mut dir = DirEntry::init(dir_, generation);
+            if !dir.add_entries_from_standalone_graph(prev_map, graph)? {
+                return Err(crate::Error::Sys(bun_errno::SystemErrno::ENOENT));
+            }
+            Ok(dir)
+        }
+
         /// Cache (or threadlocal-
         /// stash) an `EntriesOption::Err` for `dir` and hand back its address.
         fn read_directory_error(
@@ -1079,15 +1134,20 @@ pub mod fs {
             }
 
             let had_handle = maybe_handle.is_some();
+            let embedded = if had_handle {
+                None
+            } else {
+                standalone_graph_for_dir(dir)
+            };
             let mut opened = None;
-            let handle: &bun_sys::Dir = match &maybe_handle {
-                Some(lent) => bun_sys::Dir::borrow(lent),
+            let handle: Option<&bun_sys::Dir> = match &maybe_handle {
+                Some(lent) => Some(bun_sys::Dir::borrow(lent)),
+                None if embedded.is_some() => None,
                 None => match self.open_dir(dir) {
-                    Ok(fd) => opened.insert(bun_sys::Dir::from_fd(fd)),
+                    Ok(fd) => Some(&*opened.insert(bun_sys::Dir::from_fd(fd))),
                     Err(err) => return self.read_directory_error(dir, err),
                 },
             };
-
             // if we get this far, it's a real directory, so we can just store the dir name.
             // An in-place refresh always keeps the slot's existing interned name: callers
             // spell the same directory with and without a trailing slash, and rewriting
@@ -1109,7 +1169,12 @@ pub mod fs {
                 // SAFETY: BSSMap-owned, no aliasing here (entries_mutex held).
                 unsafe { &mut (*p).data }
             });
-            let mut entries = match self.readdir(prev, dir, generation, handle, iterator) {
+            let read = match (embedded, handle) {
+                (Some(graph), _) => Self::readdir_embedded(prev, dir, generation, graph),
+                (None, Some(handle)) => self.readdir(prev, dir, generation, handle, iterator),
+                (None, None) => unreachable!("a directory is either embedded or opened"),
+            };
+            let mut entries = match read {
                 Ok(e) => e,
                 Err(err) => {
                     if let Some(existing) = in_place {
@@ -1960,6 +2025,19 @@ pub mod cache {
             file_handle: Option<Fd>,
             arena: Option<&bun_alloc::Arena>,
         ) -> crate::CrateResult<Entry> {
+            if file_handle.is_none()
+                && let Some(bytes) = fs_mod::standalone_file_contents(path)
+            {
+                // The embedded section lives for the process.
+                return Ok(Entry {
+                    contents: Contents::Borrowed {
+                        ptr: bytes.as_ptr(),
+                        len: bytes.len(),
+                    },
+                    file: None,
+                });
+            }
+
             Self::read_file(path, dirname_fd, file_handle, |file| {
                 let contents = match (use_shared_buffer, arena) {
                     (false, Some(arena)) => std::borrow::Cow::Borrowed(

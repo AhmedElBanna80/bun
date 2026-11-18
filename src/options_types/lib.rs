@@ -82,6 +82,26 @@ pub mod standalone_path {
         }
     }
 
+    /// True iff `str_` is a directory of the embedded module graph: under the virtual root, or its parent
+    /// (`/$bunfs`, `B:\~BUN`).
+    #[inline]
+    pub fn is_bun_standalone_dir_path(str_: &[u8]) -> bool {
+        if is_bun_standalone_file_path(str_) {
+            return true;
+        }
+        #[cfg(windows)]
+        let str_ = bun_paths::string_paths::without_nt_prefix::<u8>(str_);
+        let without_sep = match str_ {
+            [rest @ .., b'/'] => rest,
+            [rest @ .., b'\\'] if cfg!(windows) => rest,
+            _ => str_,
+        };
+        let base = BASE_PATH.as_bytes();
+        let public = BASE_PUBLIC_PATH.as_bytes();
+        without_sep == &base[..base.len() - 1]
+            || (cfg!(windows) && without_sep == &public[..public.len() - 1])
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
