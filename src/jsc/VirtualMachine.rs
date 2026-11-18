@@ -4788,15 +4788,6 @@ impl VirtualMachine {
         } else {
             top_level_dir
         };
-        if std::env::var_os("KNEXT_DBG").is_some() {
-            eprintln!(
-                "[knext-dbg] _resolve spec={:?} source={:?} is_file={} source_to_use={:?}",
-                String::from_utf8_lossy(specifier),
-                String::from_utf8_lossy(source),
-                is_a_file_path,
-                String::from_utf8_lossy(source_to_use)
-            );
-        }
 
         // A `loop`
         // returning the resolver result; `retry_on_not_found` is consumed on
