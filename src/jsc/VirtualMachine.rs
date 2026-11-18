@@ -4785,9 +4785,28 @@ impl VirtualMachine {
             } else {
                 source
             }
+        } else if source == MAIN_FILE_NAME
+            && self
+                .standalone_module_graph
+                .is_some_and(|graph| graph.compiled_program().is_none())
+            && let Some(main) = self.main().filter(|main| {
+                bun_options_types::standalone_path::is_bun_standalone_file_path(main)
+            })
+        {
+            // The entry module of an executable asks for its modules from where it is embedded, not from the cwd.
+            bun_resolver::fs::PathName::init(main).dir_with_trailing_slash()
         } else {
             top_level_dir
         };
+        if std::env::var_os("KNEXT_DBG").is_some() {
+            eprintln!(
+                "[knext-dbg] _resolve spec={:?} source={:?} is_file={} source_to_use={:?}",
+                String::from_utf8_lossy(specifier),
+                String::from_utf8_lossy(source),
+                is_a_file_path,
+                String::from_utf8_lossy(source_to_use)
+            );
+        }
 
         // A `loop`
         // returning the resolver result; `retry_on_not_found` is consumed on
