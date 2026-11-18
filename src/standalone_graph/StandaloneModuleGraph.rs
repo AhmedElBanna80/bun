@@ -325,27 +325,19 @@ impl StandaloneModuleGraph {
         prefix.extend_from_slice(name);
         prefix.push(b'/');
 
-    /// Calls `each(path relative to dir, is_dir)` for every file and directory under the normalized directory
-    /// `dir` (its direct children only unless `recursive`); returns whether there was one.
-    fn for_each_under(
-        &self,
-        dir: &[u8],
-        recursive: bool,
-        each: &mut dyn FnMut(&[u8], bool),
-    ) -> bool {
-        let mut found = false;
-        let mut child = |key: &[u8], is_dir: bool| {
-            let Some(rel) = key
-                .strip_prefix(dir)
-                .and_then(|rest| rest.strip_prefix(b"/"))
-            else {
-                return;
-            };
-            if rel.is_empty() || (!recursive && strings::contains_char(rel, b'/')) {
+        let mut seen: StringArrayHashMap<bool> = StringArrayHashMap::new();
+        let mut push = |key: &[u8], is_dir: bool| {
+            if key.len() <= prefix.len() || !key.starts_with(&prefix) {
                 return;
             }
-            found = true;
-            each(rel, is_dir);
+            let rel = &key[prefix.len()..];
+            if recursive {
+                let _ = seen.put(rel, is_dir);
+            } else if let Some(sep) = strings::index_of_char(rel, b'/') {
+                let _ = seen.put(&rel[..sep as usize], true);
+            } else {
+                let _ = seen.put(rel, is_dir);
+            }
         };
         // An entry point that was compiled ahead of time is listed below, under the name of its source.
         let is_compiled_entry_point = |index: usize| {
@@ -404,8 +396,10 @@ impl StandaloneModuleGraph {
                 true
             });
         }
-        for key in self.files.keys() {
-            child(key, false);
+
+        let mut out: Vec<(Box<[u8]>, bool)> = Vec::with_capacity(seen.count());
+        for (k, v) in seen.iter() {
+            out.push((Box::<[u8]>::from(&k[..]), *v));
         }
         out
     }
