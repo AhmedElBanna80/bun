@@ -3118,7 +3118,7 @@ export default db;
 
         // An embedded asset (a `package.json`, a `.wasm`) goes through the loader its extension names, which
         // reads the bytes from the graph; only a JavaScript module is served as source here.
-        if !file.loader.is_javascript_like() {
+        if !file.loader.is_java_script_like() {
             return None;
         }
 
